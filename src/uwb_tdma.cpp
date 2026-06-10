@@ -1,4 +1,5 @@
 #include "uwb_tdma.h"
+#include <SPI.h>
 
 static_assert(NODE_ID >= 1 && NODE_ID <= NUM_NODES, "NODE_ID must be within 1..NUM_NODES");
 static_assert(INITIATOR_NODE_ID >= 1 && INITIATOR_NODE_ID <= NUM_NODES, "INITIATOR_NODE_ID must be within 1..NUM_NODES");
@@ -16,44 +17,83 @@ static unsigned long long responderRxTime = 0;
 static unsigned long long responderTxTime = 0;
 static int responderReplyTime = 0;
 
-static int waitForReceivedFrame(uint32_t timeoutMs)
+static void writeFastCommand(uint8_t command)
 {
-    const uint32_t started = millis();
-    while (millis() - started < timeoutMs) {
-        const int rxStatus = DW3000.receivedFrameSucc();
-        if (rxStatus != 0) {
-            return rxStatus;
-        }
-        delay(1);
-    }
-    return 0;
+    const uint8_t header = 0x81 | ((command & 0x1F) << 1);
+    digitalWrite(CHIP_SELECT_PIN, LOW);
+    SPI.transfer(header);
+    digitalWrite(CHIP_SELECT_PIN, HIGH);
 }
 
-static bool receivedFrameIsForThisNode(uint8_t expectedSender, uint8_t expectedStage)
+static void stopRadio()
 {
-    const uint8_t sender = DW3000.getSenderID();
-    const uint8_t destination = DW3000.getDestinationID();
-    const uint8_t stage = DW3000.ds_getStage();
+    writeFastCommand(0x00); // TXRXOFF: leave active TX/RX before the next exchange.
+    delayMicroseconds(200);
+}
 
-    if (DW3000.ds_isErrorFrame()) {
-        Serial.println("[WARN] Received DS-TWR error frame");
-        return false;
+static bool waitForExpectedFrame(
+    uint8_t expectedSender,
+    uint8_t expectedStage,
+    uint32_t timeoutMs,
+    unsigned long long *rxTimestamp = nullptr
+)
+{
+    const uint32_t startedMs = millis();
+    bool loggedUnexpectedFrame = false;
+    bool loggedRxError = false;
+
+    while (millis() - startedMs < timeoutMs) {
+        const int rxStatus = DW3000.receivedFrameSucc();
+        if (rxStatus == 0) {
+            delay(1);
+            continue;
+        }
+
+        if (rxStatus != 1) {
+            if (!loggedRxError) {
+                Serial.printf("[WARN] RX error while waiting for Node %u stage %u (rxStatus=%d)\n",
+                              expectedSender,
+                              expectedStage,
+                              rxStatus);
+                loggedRxError = true;
+            }
+            DW3000.clearSystemStatus();
+            DW3000.standardRX();
+            continue;
+        }
+
+        const uint8_t sender = DW3000.getSenderID();
+        const uint8_t destination = DW3000.getDestinationID();
+        const uint8_t stage = DW3000.ds_getStage();
+
+        if (!DW3000.ds_isErrorFrame() &&
+            sender == expectedSender &&
+            destination == NODE_ID &&
+            stage == expectedStage) {
+            if (rxTimestamp != nullptr) {
+                *rxTimestamp = DW3000.readRXTimestamp();
+            }
+            return true;
+        }
+
+        if (!loggedUnexpectedFrame) {
+            Serial.printf(
+                "[WARN] Ignored unrelated frame: sender=%u dest=%u stage=%u, waiting for sender=%u dest=%u stage=%u\n",
+                sender,
+                destination,
+                stage,
+                expectedSender,
+                NODE_ID,
+                expectedStage
+            );
+            loggedUnexpectedFrame = true;
+        }
+
+        DW3000.clearSystemStatus();
+        DW3000.standardRX();
     }
 
-    if (sender != expectedSender || destination != NODE_ID || stage != expectedStage) {
-        Serial.printf(
-            "[WARN] Ignoring frame: sender=%u dest=%u stage=%u, expected sender=%u dest=%u stage=%u\n",
-            sender,
-            destination,
-            stage,
-            expectedSender,
-            NODE_ID,
-            expectedStage
-        );
-        return false;
-    }
-
-    return true;
+    return false;
 }
 
 static void sendRangingInfo(uint8_t peerId, int roundTime, int replyTime)
@@ -128,27 +168,22 @@ void uwb_init()
 
 static bool doInitiator(uint8_t targetId)
 {
-    int rxStatus = 0;
     int tRoundA = 0;
     int tReplyA = 0;
 
     Serial.printf("[RANGE] Node %u -> Node %u\n", NODE_ID, targetId);
 
+    stopRadio();
     DW3000.setDestinationID(targetId);
     DW3000.clearSystemStatus();
     DW3000.ds_sendFrame(1);
     const unsigned long long txPollTime = DW3000.readTXTimestamp();
 
-    rxStatus = waitForReceivedFrame(RESPONSE_TIMEOUT_MS);
-    if (rxStatus != 1) {
-        Serial.printf("[WARN] No valid response from Node %u (rxStatus=%d)\n", targetId, rxStatus);
+    unsigned long long rxResponseTime = 0;
+    if (!waitForExpectedFrame(targetId, 2, RESPONSE_TIMEOUT_MS, &rxResponseTime)) {
+        Serial.printf("[WARN] No valid stage-2 response from Node %u\n", targetId);
         DW3000.clearSystemStatus();
-        return false;
-    }
-
-    const unsigned long long rxResponseTime = DW3000.readRXTimestamp();
-    if (!receivedFrameIsForThisNode(targetId, 2)) {
-        DW3000.clearSystemStatus();
+        stopRadio();
         return false;
     }
     DW3000.clearSystemStatus();
@@ -160,15 +195,10 @@ static bool doInitiator(uint8_t targetId)
     const unsigned long long txFinalTime = DW3000.readTXTimestamp();
     tReplyA = static_cast<int>(txFinalTime - rxResponseTime);
 
-    rxStatus = waitForReceivedFrame(RESPONSE_TIMEOUT_MS);
-    if (rxStatus != 1) {
-        Serial.printf("[WARN] No ranging-info frame from Node %u (rxStatus=%d)\n", targetId, rxStatus);
+    if (!waitForExpectedFrame(targetId, 4, RESPONSE_TIMEOUT_MS)) {
+        Serial.printf("[WARN] No valid stage-4 ranging info from Node %u\n", targetId);
         DW3000.clearSystemStatus();
-        return false;
-    }
-
-    if (!receivedFrameIsForThisNode(targetId, 4)) {
-        DW3000.clearSystemStatus();
+        stopRadio();
         return false;
     }
 
@@ -183,6 +213,7 @@ static bool doInitiator(uint8_t targetId)
     Serial.println(" cm");
 
     DW3000.clearSystemStatus();
+    stopRadio();
     return true;
 }
 
